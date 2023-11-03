@@ -108,6 +108,13 @@ impl<S: ConnBaseTrait> EventHandler<Agent, S> for Handler {
 这段代码是监听0.0.0.0:30020,并将此端口的数据代理到172.30.0.3:30020
 
 -------------
+引用方式
+```rust
+[dependencies]
+rustnet = { git = "https://github.com/luyu6056/rustnet.git", version = "0.1.1"}
+```
+
+-------------
 
 ## 将要做的事情 Features
 - [ ] **TLS/SSL** support
