@@ -37,17 +37,15 @@ pub enum NetError {
     #[error("close no error")]
     Close,
 
-    #[error("ProtocolErr {0}")]
-    ProtocolErr(String),
-
     #[error("channel {0}")]
     Channel(String),
 
     #[error("{0}")]
     FormatErr(String),
 
-    #[error("json转化失败 {0}")]
-    JsonErr(String),
+    ///Server未启动
+    #[error("No server")]
+    NoStartServer,
 }
 impl NetError {
     pub fn new_with_string(s: String) -> NetError {

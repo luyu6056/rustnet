@@ -25,7 +25,6 @@ unsafe impl Send for MsgBufferStatic {}
 unsafe impl Sync for MsgBufferStatic {}
 
 //Box<[u8]>实现
-#[derive(Debug)]
 pub struct MsgBuffer {
     b: Box<[u8]>, //指向raw或者其他地方的裸指针
     max_buf_size: usize,

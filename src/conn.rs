@@ -1,18 +1,17 @@
-
 use crate::afterfunc::AfterFn;
 use crate::buffer::MsgBufferStatic;
-use crate::AsyncWriteExt;
+use crate::err::NetError::ShutdownServer;
 use crate::Duration;
 use crate::EventHandler;
 use crate::Instant;
 use crate::NetError;
+use crate::{AsyncWriteExt, ServerStartConn};
 use crate::{Receiver, Sender};
 use ::tokio::macros::support::Poll::{Pending, Ready};
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -26,14 +25,15 @@ pub type ConnAsyncFn<T> =
 pub type ConnAsyncResult<'a> = Pin<Box<dyn Future<Output = Result<(), NetError>> + Send + 'a>>;
 
 pub struct Conn<T: ?Sized, S: ConnBaseTrait> {
-    inner: ConnBase<S>,
+    pub(crate) inner: ConnBase<T, S>,
     pub(crate) id: u64,
     pub(crate) react_tx: Sender<ReactOperationChannel>,
     after_fn: Arc<Mutex<AfterFn<T, S>>>,
 }
 #[derive(Debug, Clone)]
 pub struct ConnWrite {
-    react_tx: Sender<ReactOperationChannel>,
+    pub addr :SocketAddr,
+    pub(crate) react_tx: Sender<ReactOperationChannel>,
 }
 impl ConnWrite {
     pub async fn write(&self, data: Vec<u8>) -> Result<(), NetError> {
@@ -64,9 +64,9 @@ impl ConnWrite {
             })
             .await?)
     }
-    pub fn close(&self, _reason: Option<impl Into<String>>) -> Result<(), NetError> {
+    pub fn close(&self, reason: Option<String>) -> Result<(), NetError> {
         Ok(self.react_tx.try_send(ReactOperationChannel {
-            op: ReactOperation::Exit,
+            op: ReactOperation::Exit(reason),
             res: None,
         })?)
     }
@@ -80,32 +80,31 @@ impl<T, S: ConnBaseTrait> fmt::Debug for Conn<T, S> {
     }
 }
 
-static mut CONN_ID: AtomicU64 = AtomicU64::new(0);
 impl<T, S> Conn<T, S>
 where
+    T: Send,
     S: ConnBaseTrait,
 {
     pub fn new(
         addr: SocketAddr,
+        id: u64,
         react_tx: Sender<ReactOperationChannel>,
         after_fn: Arc<Mutex<AfterFn<T, S>>>,
         readtimeout: Duration,
         stream: Stream<S>,
         max_package_size: usize,
+        server: Arc<dyn ServerStartConn<T, S>>,
     ) -> Self {
-        unsafe {
-            let mut c = Conn {
-                inner: ConnBase::new(addr, stream),
-                id: CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Acquire),
-                react_tx: react_tx.clone(),
-                after_fn: after_fn,
-            };
-            c.inner.set_react_tx(react_tx);
-            c.inner.set_readtimeout(readtimeout);
-            c.inner.set_max_package_size(max_package_size);
-            //println!("新建{:}地址{:}", c.id, c.readbuf.ptr.addr());
-            c
-        }
+        let mut c = Conn {
+            inner: ConnBase::new(addr, stream, server),
+            id,
+            react_tx: react_tx.clone(),
+            after_fn: after_fn,
+        };
+        c.inner.set_react_tx(react_tx);
+        c.inner.set_readtimeout(readtimeout);
+        c.inner.set_max_package_size(max_package_size);
+        c
     }
 
     pub async fn write_data(&mut self, data: Vec<u8>) -> Result<(), NetError> {
@@ -128,9 +127,9 @@ where
         self.inner.buffer_len()
     }
     //关闭连接
-    pub fn close(&self, _reason: Option<impl Into<String>>) -> Result<(), NetError> {
+    pub fn close(&self, reason: Option<String>) -> Result<(), NetError> {
         Ok(self.react_tx.try_send(ReactOperationChannel {
-            op: ReactOperation::Exit,
+            op: ReactOperation::Exit(reason),
             res: None,
         })?)
     }
@@ -140,6 +139,7 @@ where
             op: ReactOperation::ExitServer(reason.clone()),
             res: None,
         })?;
+
         self.close(reason)?;
 
         Ok(())
@@ -172,35 +172,36 @@ where
     /// 获取一个写出用的conn
     pub fn get_write_conn(&self) -> ConnWrite {
         ConnWrite {
+            addr:self.addr(),
             react_tx: self.react_tx.clone(),
         }
     }
-    pub fn get_inner(&mut self) -> &mut ConnBase<S> {
+    pub fn get_inner(&mut self) -> &mut ConnBase<T, S> {
         &mut self.inner
     }
 }
 
-#[derive(Debug)]
+
 pub(crate) struct WriteData {
     data: Vec<u8>,
     time_out: Option<Instant>,
 }
 
-#[derive(Debug)]
+
 pub struct ReactOperationChannel {
     pub(crate) op: ReactOperation,
     pub(crate) res: Option<Sender<ReactOperationResult>>,
 }
-#[derive(Debug)]
+
 pub(crate) enum ReactOperation {
-    Exit, //退出handler
+    Exit(Option<String>), //退出handler
     ExitServer(Option<String>),
     Write(WriteData),
     Afterfn(u64),
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+
 pub(crate) enum ReactOperationResult {
     Exit,         //write协程退出了
     WriteOk,      //
@@ -209,31 +210,25 @@ pub(crate) enum ReactOperationResult {
 //主协程
 
 pub(crate) async fn handler_reactreadwrite<E, T, S>(
-    mut conn: Conn<T, S>,
+    conn: &mut Conn<T, S>,
+    ctx: &mut T,
     mut event_handler: E,
     mut react_rx: Receiver<ReactOperationChannel>,
-    callback: Option<Box<dyn FnOnce(T) -> Result<T, NetError> + Send>>,
 ) -> Result<Option<String>, NetError>
 where
     E: EventHandler<T, S> + Send + Copy + Sync,
     T: Send,
     S: ConnBaseTrait + 'static,
 {
-    let mut ctx = match callback {
-        Some(f) => f.call_once((event_handler.on_opened(&mut conn.inner).await?,))?,
-        None => event_handler.on_opened(&mut conn.inner).await?,
-    };
-
     //ctx.set_conn(conn.clone());
     #[doc(hidden)]
     mod __tokio_select_util {
-        #[derive(Debug)]
         pub(super) enum Out<_0, _1> {
             Read(_0),
             ReactOp(_1),
         }
     }
-    let mut exit_reason: Option<String> = None;
+    let exit_reason: Option<String> ;
     let after_fn = conn.after_fn.clone();
     loop {
         unsafe {
@@ -256,7 +251,8 @@ where
                 __tokio_select_util::Out::Read(res) => {
                     //println!("ok read");
                     res?;
-                    while conn.buffer_len() > 0 && event_handler.react(&mut conn.inner, &mut ctx).await? {
+                    while conn.buffer_len() > 0 && event_handler.react(&mut conn.inner, ctx).await?
+                    {
                         //println!("处理下一条")
                     }
                 }
@@ -290,16 +286,21 @@ where
                                     }
                                 }
                             },
-                            ReactOperation::Exit => {
+                            ReactOperation::Exit(reason) => {
+                                exit_reason=reason;
                                 break;
                             }
                             ReactOperation::ExitServer(reason) => {
-                                exit_reason = reason;
+                                exit_reason = reason.clone();
+                                if let Some(exit_tx) = conn.inner.server.get_exit_tx() {
+                                    exit_tx.send(ShutdownServer(reason.unwrap_or_default())).await?;
+                                };
+
                                 break;
                             }
                             ReactOperation::Afterfn(id) => {
                                 if let Some(f) = after_fn.lock().await.remove_task(id) {
-                                    f.call_once((&mut conn,)).await?;
+                                    f.call_once((conn,)).await?;
                                 };
                             }
                         }
@@ -309,7 +310,6 @@ where
                 }
             }
         }
-
         //println!("react{:}地址{:}", conn.id, conn.readbuf.ptr.addr());
     }
 
@@ -338,16 +338,21 @@ where
     }
 }
 pub trait ConnBaseTrait = AsyncReadExt + AsyncWriteExt + std::marker::Unpin + Send + Sync;
-pub struct ConnBase<S: ConnBaseTrait> {
+pub struct ConnBase<T: ?Sized, S: ConnBaseTrait> {
     addr: SocketAddr,
     stream: Stream<S>,
     pub(crate) readbuf: MsgBufferStatic,
     readtimeout: Duration,
     max_package_size: usize,
     react_tx: Option<Sender<ReactOperationChannel>>,
+    pub server: Arc<dyn ServerStartConn<T, S>>,
 }
-impl<S: ConnBaseTrait> ConnBase<S> {
-    pub fn new(addr: SocketAddr, stream: Stream<S>) -> Self {
+impl<T, S: ConnBaseTrait> ConnBase<T, S> {
+    pub fn new(
+        addr: SocketAddr,
+        stream: Stream<S>,
+        server: Arc<dyn ServerStartConn<T, S>>,
+    ) -> Self {
         Self {
             addr: addr,
             stream,
@@ -355,6 +360,7 @@ impl<S: ConnBaseTrait> ConnBase<S> {
             readtimeout: Duration::from_secs(60),
             max_package_size: crate::MAX as usize,
             react_tx: None,
+            server: server,
         }
     }
     pub fn set_react_tx(&mut self, react_tx: Sender<ReactOperationChannel>) {
@@ -430,10 +436,13 @@ impl<S: ConnBaseTrait> ConnBase<S> {
     pub async fn readline(&self) -> Result<String, NetError> {
         Err(NetError::Custom("readline未处理".to_string()))
     }
-    pub fn close(&self, _reason: Option<impl Into<String>>) -> Result<(), NetError> {
+    pub fn buffer_reset(&self) {
+        unsafe { (*self.readbuf.ptr).reset() }
+    }
+    pub fn close(&self, reason: Option< String>) -> Result<(), NetError> {
         if let Some(tx) = &self.react_tx {
             return Ok(tx.try_send(ReactOperationChannel {
-                op: ReactOperation::Exit,
+                op: ReactOperation::Exit(reason),
                 res: None,
             })?);
         };
@@ -442,6 +451,7 @@ impl<S: ConnBaseTrait> ConnBase<S> {
     pub fn get_write_conn(&self) -> Result<ConnWrite, NetError> {
         if let Some(tx) = &self.react_tx {
             return Ok(ConnWrite {
+                addr:self.addr,
                 react_tx: tx.clone(),
             });
         };
